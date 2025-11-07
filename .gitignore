@@ -1,0 +1,11 @@
+# generated files
+*.gen
+*.gen.*
+
+# Python stuff
+__pycache__/
+.venv/
+
+# other
+*.pth
+unimatch/
