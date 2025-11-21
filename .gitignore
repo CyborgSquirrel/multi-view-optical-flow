@@ -2,10 +2,16 @@
 *.gen
 *.gen.*
 
-# Python stuff
+# Python
 __pycache__/
 .venv/
+
+# Jupyter
+.ipynb_checkpoints/
+.virtual_documents/
 
 # other
 *.pth
 unimatch/
+unimatch_utils/
+nersemble/

@@ -1,16 +1,24 @@
 import contextlib as ctl
 import functools as ft
 import glob
+import hashlib
 import itertools as itt
 import logging
 import os
 import os.path as osp
 import subprocess
+import threading
 import time
-from typing import Callable, Optional
+import urllib
+from typing import Callable, Generic, Optional, TypeVar
+
+import requests
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 _logger = logger
+
+REPO_ROOT = osp.dirname(__file__)
 
 def proc(
   executable: str,
@@ -37,14 +45,46 @@ def proc(
 
   return None
 
-@ctl.contextmanager
-def ctx_chdir(path):
-  prev_cwd = os.getcwd()
-  os.chdir(path)
-  try:
-    yield
-  finally:
-    os.chdir(prev_cwd)
+DL_CACHE_DIR = osp.join(REPO_ROOT, 'downloads.gen')
+def dl_cached(url: str) -> str:
+  """Downloads file at `url` and caches it locally."""
+
+  url_parsed = urllib.parse.urlparse(url)
+  h = hashlib.sha256(url.encode()).digest()[:16].hex()
+  name = h + '-' + osp.basename(url_parsed.path)
+  path = osp.join(DL_CACHE_DIR, name)
+
+  if osp.exists(path):
+    logger.info('Using cached %r', url)
+  else:
+    os.makedirs(DL_CACHE_DIR, exist_ok=True)
+
+    temp_path = path + '.temp'
+    logger.info('Downloading %r...', url)
+    with ctl.ExitStack() as stack:
+      r = stack.enter_context(requests.get(url, stream=True))
+      f = stack.enter_context(open(temp_path, 'wb'))
+
+      size = r.headers.get('Content-Length')
+      if size is not None:
+        size = int(size)
+
+      pbar = None
+      if size is not None:
+        pbar = stack.enter_context(tqdm(desc='Downloading...', total=size))
+
+      for chunk in r.iter_content(chunk_size=8192):
+        f.write(chunk)
+        pbar.update(len(chunk))
+    logger.info('Finished downloading %r', url)
+    os.rename(temp_path, path)
+  return path
+
+def resolve_local_path(path_or_url: str) -> str:
+  parsed = urllib.parse.urlparse(path_or_url)
+  if parsed.netloc == "":
+    return parsed.path
+  return dl_cached(path_or_url)
 
 def iglob(pattern: str, strict: bool = True):
   '''Version of `glob.iglob` which makes sure that at least one file matches the pattern.'''
@@ -56,6 +96,68 @@ def iglob(pattern: str, strict: bool = True):
     except StopIteration as ex:
       raise RuntimeError(f'File pattern {repr(pattern)} didn\'t match any files.') from ex
   yield from paths
+
+T = TypeVar('T')
+
+class Oneshot(Generic[T]):
+  inner: T
+
+  def __init__(self):
+    self.lock = threading.Lock()
+    self.event = threading.Event()
+
+  def put(self, val: T):
+    with self.lock:
+      if hasattr(self, 'inner'):
+        raise RuntimeError('Value has already been put')
+      self.inner = val
+      self.event.set()
+
+  def get(self) -> T:
+    self.event.wait()
+    with self.lock:
+      return self.inner
+
+class ThreadPool:
+  def __init__(self, max_workers=8):
+    self.max_workers = max_workers
+    self.sem = threading.Semaphore(max_workers)
+    self.lock = threading.Lock()
+    self.open = False
+
+  def __wrap(self, fn):
+    def wrapped(*args, **kwargs):
+      try:
+        return fn(*args, **kwargs)
+      finally:
+        self.sem.release()
+    return wrapped
+
+  def submit(self, fn, *args, **kwargs):
+    with self.lock:
+      if not self.open:
+        raise RuntimeError(f"Can't submit task when {self.open=}")
+
+    self.sem.acquire()
+    thread = threading.Thread(
+      target=self.__wrap(fn),
+      args=args, kwargs=kwargs,
+    )
+    thread.start()
+
+  def __enter__(self):
+    with self.lock:
+      self.open = True
+    return self
+
+  def __exit__(self, ex_type, ex_val, ex_tb):
+    with self.lock:
+      self.open = False
+
+    # Wait for all workers to finish
+    for _ in range(self.max_workers):
+      self.sem.acquire()
+    self.sem.release(self.max_workers)
 
 class PrefixLogger(logging.LoggerAdapter):
   def __init__(self, logger, prefix):
