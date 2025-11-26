@@ -12,6 +12,9 @@ __pycache__/
 
 # other
 *.pth
+*.zip
 unimatch/
 unimatch_utils/
 nersemble/
+
+experiments/

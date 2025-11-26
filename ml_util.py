@@ -1,12 +1,15 @@
 import dataclasses as dc
 import logging
+import re
+import struct
 from pathlib import Path
-from typing import Callable
+from typing import Callable, ClassVar, Optional, Self
 
+import imageio as iio
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import ExifTags, Image
 
 logger = logging.getLogger(__name__)
 
@@ -15,18 +18,47 @@ try:
 except ModuleNotFoundError:
   logger.warning("Unimatch not setup, can't import it...")
 
-def unimatch_load_img(img: str | Path) -> torch.Tensor:
+RE_VIDEO_FRAME = re.compile(r"(?P<name>.*[.]mp4):(?P<index>\d+)$")
+
+def load_img(
+  img: str | Path,
+  *,
+  handle_video=True,
+  output_type=torch.Tensor,
+) -> torch.Tensor:
+  if isinstance(img, str):
+    img = Path(img)
+  if handle_video:
+    if isinstance(img, Path):
+      m = RE_VIDEO_FRAME.match(img.name)
+      if m is not None:
+        img = img.with_name(m.group("name"))
+        index = int(m.group("index"))
+        with iio.imopen(img, "r", plugin="pyav") as f:
+          img = f.read(index=index)
+  if isinstance(img, Path):
+    img = Image.open(img)
+    img = img.convert("RGB")
+    img = np.asarray(img)
+
+  if output_type is np.ndarray:
+    return img
+
+  img = torch.from_numpy(img).float()
+  return img
+
+def unimatch_load_img(img: str | Path | Image.Image | np.ndarray) -> torch.Tensor:
   if isinstance(img, Path):
     img = str(img)
   if isinstance(img, str):
     img = unimatch_utils.frame_utils.read_gen(img)
   if isinstance(img, Image.Image):
-    img = img.convert('RGB')
+    img = img.convert("RGB")
     img = np.array(img).astype(np.uint8)
   if isinstance(img, np.ndarray):
     dtype = np.uint8
     if img.dtype != dtype:
-      raise TypeError(f'Expected {dtype=}, got {img.dtype=}')
+      raise TypeError(f"Expected {dtype=}, got {img.dtype=}")
   img = img[..., :3]  # [H, W, C]
   img = torch.from_numpy(img).permute(2, 0, 1).float()  # [C, H, W]
   return img
@@ -35,8 +67,8 @@ def unimatch_get_transform(
   imgs: list[torch.Tensor],  # [C, H, W]
   *,
   padding_factor=8,
-  infer_size=None,
-  infer_scale=None,
+  flow_size=None,
+  flow_scale=None,
 ) -> tuple[
   Callable[[torch.Tensor], torch.Tensor],
   Callable[[torch.Tensor], torch.Tensor],
@@ -47,14 +79,14 @@ def unimatch_get_transform(
     raise RuntimeError("Shapes of all images must be equal")
 
   # Resize to nearest size or specified size
-  if infer_size is None:
+  if flow_size is None:
     size = orig_size
 
     # Scale size
-    if infer_scale is not None:
+    if flow_scale is not None:
       size = (
-        size[-2] * infer_scale,
-        size[-1] * infer_scale,
+        size[-2] * flow_scale,
+        size[-1] * flow_scale,
       )
 
     # Snap size to padding factor
@@ -63,8 +95,8 @@ def unimatch_get_transform(
       int(np.ceil(size[-1] / padding_factor)) * padding_factor,
     )
 
-    infer_size = size
-  assert isinstance(infer_size, tuple)
+    flow_size = size
+  assert isinstance(flow_size, tuple)
 
   # The model is trained with size: width > height
   inference_transpose = False
@@ -73,12 +105,12 @@ def unimatch_get_transform(
 
   def trans_fn(img: torch.Tensor):
     # Resize
-    if infer_size != orig_size:
+    if flow_size != orig_size:
       img = img.unsqueeze(0)
       img = F.interpolate(
         img,
-        size=infer_size,
-        mode='bilinear',
+        size=flow_size,
+        mode="bilinear",
         align_corners=True,
       )
       img = img.squeeze(0)
@@ -95,12 +127,12 @@ def unimatch_get_transform(
       img = torch.transpose(img, -2, -1)
 
     # Resize
-    if infer_size != orig_size:
+    if flow_size != orig_size:
       img = img.unsqueeze(0)
       img = F.interpolate(
         img,
         size=orig_size,
-        mode='bilinear',
+        mode="bilinear",
         align_corners=True,
       )
       img = img.squeeze(0)
@@ -108,8 +140,8 @@ def unimatch_get_transform(
       # NOTE(andrei): I _think_ this adapts the flow to the new size, but
       # honestly not 100% sure...
       if scale_flow:
-        img[:, 0] = img[:, 0] * orig_size[-1] / infer_size[-1]
-        img[:, 1] = img[:, 1] * orig_size[-2] / infer_size[-2]
+        img[:, 0] = img[:, 0] * orig_size[-1] / flow_size[-1]
+        img[:, 1] = img[:, 1] * orig_size[-2] / flow_size[-2]
 
     return img
 
@@ -146,8 +178,8 @@ def flow_to_image_rgb(
   flow = Image.fromarray(flow)
   return flow
 
-def hsv_image_to_rgb(
-  # [H, W, 3]
+def hsv_to_rgb(
+  # [..., 3]
   hsv: np.ndarray,
 ) -> np.ndarray:
   h = hsv[..., 0]
@@ -179,10 +211,82 @@ def hsv_image_to_rgb(
 
   return rgb
 
+def rgb_to_hsv(
+  # [..., 3]
+  rgb: np.ndarray
+) -> np.ndarray:
+  r = rgb[..., 0]
+  g = rgb[..., 1]
+  b = rgb[..., 2]
+
+  cmax = np.maximum.reduce([r, g, b])
+  cmin = np.minimum.reduce([r, g, b])
+  delta = cmax - cmin
+
+  # Hue calculation
+  h = np.zeros_like(cmax)
+  mask = delta != 0
+
+  r_eq_max = (cmax == r) & mask
+  g_eq_max = (cmax == g) & mask
+  b_eq_max = (cmax == b) & mask
+
+  h[r_eq_max] = ( (g[r_eq_max] - b[r_eq_max]) / delta[r_eq_max] ) % 6
+  h[g_eq_max] = ( (b[g_eq_max] - r[g_eq_max]) / delta[g_eq_max] ) + 2
+  h[b_eq_max] = ( (r[b_eq_max] - g[b_eq_max]) / delta[b_eq_max] ) + 4
+
+  h = h / 6.0
+  h[h < 0] += 1.0  # Ensure hue is in [0, 1]
+
+  # Saturation calculation
+  s = np.zeros_like(cmax)
+  s[cmax != 0] = delta[cmax != 0] / cmax[cmax != 0]
+
+  # Value calculation
+  v = cmax
+
+  hsv = np.stack([h, s, v], axis=-1)
+  return hsv
+
+def test_rgb_hsv_conversion():
+  space = np.linspace(0, 1, 50)
+  rgb = np.meshgrid(space, space, space)
+  rgb = np.stack(rgb, axis=-1)
+  hsv = rgb_to_hsv(rgb)
+  rgb_roundtrip = hsv_to_rgb(hsv)
+  assert np.all(np.isclose(rgb, rgb_roundtrip))
+
+@dc.dataclass
+class FlowExif:
+  mag_max: float
+
+  STRUCT_FMT: ClassVar = ">d"
+  def exif_encode(self) -> bytes:
+    return struct.pack(self.STRUCT_FMT, self.mag_max)
+  @classmethod
+  def exif_decode(cls, src: bytes) -> Self:
+    mag_max, = struct.unpack(cls.STRUCT_FMT, src)
+    return cls(mag_max)
+
+  def img_write(self, img: Image.Image):
+    exif = img.getexif()
+    exif[ExifTags.IFD.MakerNote] = self.exif_encode()
+  @classmethod
+  def img_read(cls, img: Image.Image) -> Self:
+    exif = img.getexif()
+    exif_data = exif[ExifTags.IFD.MakerNote]
+    return cls.exif_decode(exif_data)
+
 def flow_to_image_hue(
   # [H, W, 2]
   flow: torch.Tensor | np.ndarray,
+  *,
+  exif: bool = True,
+  mag_max: Optional[float] = None,
 ) -> Image.Image:
+  with_exif = exif
+  del exif
+
   shape = tuple(flow.shape)
   match shape:
     case (_h, _w, 2): pass
@@ -191,23 +295,79 @@ def flow_to_image_hue(
   if isinstance(flow, torch.Tensor):
     flow = flow.cpu().numpy()
 
-  ang = np.atan2(flow[..., 0], flow[..., 1])
-  ang = (np.pi + ang) / (np.pi * 2)
+  ang = np.atan2(flow[..., 1], flow[..., 0])
+  ang = (ang + np.pi) / (np.pi * 2)
 
   mag = np.linalg.vector_norm(flow, axis=-1, ord=2)
-  mag = mag / np.max(mag)
+  if mag_max is None:
+    mag_max = np.max(mag).item()
+  mag = mag / mag_max
 
   flow = np.stack([
     ang,
     mag,
     np.ones(shape[:-1]),
   ], axis=-1)
-  flow = hsv_image_to_rgb(flow)
+  flow = hsv_to_rgb(flow)
   flow = np.clip(flow * 255, 0, 255).astype(np.uint8)
 
   flow = Image.fromarray(flow)
+
+  if with_exif:
+    flow_exif = FlowExif(mag_max)
+    flow_exif.img_write(flow)
+
   return flow
 
+# [H, W, 2]
+def image_to_flow_hue(img: str | Path | Image.Image) -> np.ndarray:
+  if isinstance(img, str):
+    img = Path(img)
+  if isinstance(img, Path):
+    img = Image.open(img)
+  if isinstance(img, Image.Image):
+    exif = FlowExif.img_read(img)
+
+    img: np.ndarray
+    img = np.asarray(img)
+    img = img.astype(np.float64)
+    img = img / 255
+
+    img = rgb_to_hsv(img)
+    ang = img[..., 0] * np.pi * 2 - np.pi
+    mag = img[..., 1] * exif.mag_max
+
+    flow = np.stack([np.cos(ang), np.sin(ang)], axis=-1) * mag[..., None]
+    return flow
+  raise RuntimeError(f"Unexpected {type(img)=}")
+
+def test_image_flow_hue_conversion():
+  def test_case(*, rad, mag, rtol=None, atol=None):
+    mag_max = mag
+    del mag
+
+    space = np.linspace(-1, 1, num=rad)
+    x, y = np.meshgrid(space, space)
+
+    flow = np.stack([x, y], axis=-1)
+    mag = np.linalg.vector_norm(flow, axis=-1)
+    flow[mag > 1, :] = 0
+
+    flow = flow * mag_max
+
+    img = flow_to_image_hue(flow, exif=True)
+    flow_roundtrip = image_to_flow_hue(img)
+
+    kwargs = dict(rtol=rtol, atol=atol)
+    if kwargs["rtol"] is None: kwargs.pop("rtol")
+    if kwargs["atol"] is None: kwargs.pop("atol")
+
+    assert np.all(np.isclose(flow, flow_roundtrip, **kwargs))
+
+  test_case(rad=100, mag=5, atol=0.05)
+  test_case(rad=100, mag=100, atol=0.75)
+
+# Taken from here https://github.com/lizhihao6/Forward-Warp
 def forward_warp(im0, flow, interpolation_mode):
   im0 = im0.to(torch.float32)
   im1 = torch.zeros_like(im0)

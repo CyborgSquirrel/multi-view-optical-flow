@@ -1,17 +1,25 @@
 import argparse
 import contextlib as ctl
+import functools as ft
 import logging
 import os
+import random
 import shutil
+import zipfile
 from argparse import ArgumentParser
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from zipfile import ZipFile
 
+import humanize
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
-from ml_util import (flow_to_image_hue, unimatch_get_transform,
-                     unimatch_load_img)
+from colab_util import IN_COLAB
+from ml_util import (flow_to_image_hue, forward_warp, image_to_flow_hue,
+                     load_img, unimatch_get_transform, unimatch_load_img)
 from util import deps, make_setup_subparser, osp, proc, resolve_local_path
 
 logger = logging.getLogger(__name__)
@@ -21,30 +29,103 @@ try:
 except ModuleNotFoundError:
   logger.warning("Unimatch not setup, can't import it...")
 
-# Set this because otherwise PyTorch hangs forever sometimes
-os.environ['OMP_NUM_THREADS'] = '1'
+# For most everything we need to run in REPO_ROOT
+REPO_ROOT = osp.dirname(__file__)
+run_dir = os.getcwd()
+os.chdir(REPO_ROOT)
 
-IS_NIXOS = osp.exists('/nix')
+# Set this because otherwise PyTorch hangs forever sometimes
+os.environ["OMP_NUM_THREADS"] = "1"
+
+IS_NIXOS = osp.exists("/nix")
 
 # Fix linker errors using nix-ld when running on NixOS
 if IS_NIXOS:
-  os.environ['LD_LIBRARY_PATH'] = os.environ['NIX_LD_LIBRARY_PATH']
+  os.environ["LD_LIBRARY_PATH"] = os.environ["NIX_LD_LIBRARY_PATH"]
 
 parser = ArgumentParser()
-subparsers = parser.add_subparsers(dest='action', required=True)
+subparsers = parser.add_subparsers(dest="action", required=True)
 setup_subparser = make_setup_subparser(subparsers)
 
-UNIMATCH_GIT = 'https://github.com/autonomousvision/unimatch'
-UNIMATCH_REPO_DIR = 'unimatch.gen'
-UNIMATCH_DIR = 'unimatch'
-UNIMATCH_UTILS_DIR = 'unimatch_utils'
+############################################################
+#                          Colab                           #
+############################################################
+
+GDRIVE_DEST = Path("/home/andrei/gdrive/adl4cv")
+
+@ft.cache
+def get_file_paths():
+  out = proc(
+    "fd", "--hidden", "--type=file",
+    stdout=True,
+  )
+  file_paths = out.split()
+  return file_paths
+
+@setup_subparser()
+def tool_deploy_list():
+  file_paths = get_file_paths()
+  print("\n".join(file_paths))
+
+def write_ar_code(dst: str | Path):
+  logger.info("Generating code archive...")
+
+  if isinstance(dst, str):
+    dst = Path(dst)
+
+  dir_name = dst.name
+  if (dot := dst.name.find(".")) != -1:
+    dir_name = dir_name[:dot]
+
+  file_paths = get_file_paths()
+  with ZipFile(dst, "w", compression=zipfile.ZIP_DEFLATED) as z:
+    code_id = random.randbytes(4).hex()
+    logger.info("Setting code archive id to %r...", code_id)
+    z.writestr(osp.join(dir_name, "id.txt"), code_id)
+
+    for file_path in file_paths:
+      z.write(
+        file_path,
+        osp.join(dir_name, file_path),
+      )
+
+  stat = dst.stat()
+  logger.info("Generated code archive sized %s", humanize.naturalsize(stat.st_size))
+
+@setup_subparser()
+def tool_deploy_code():
+  logger.info("Making sure project directory exists...")
+  GDRIVE_DEST.mkdir(parents=True, exist_ok=True)
+
+  with TemporaryDirectory() as tmp_dir:
+    tmp_dir = Path(tmp_dir)
+
+    ar_path = tmp_dir / "code.zip"
+    write_ar_code(ar_path)
+
+    logger.info("Uploading code archive...")
+    shutil.move(ar_path, GDRIVE_DEST / ar_path.name)
+
+@setup_subparser()
+def tool_deploy_nb():
+  GDRIVE_DEST.mkdir(parents=True, exist_ok=True)
+  shutil.copy("main.ipynb", GDRIVE_DEST)
+
+############################################################
+#                         Unimatch                         #
+############################################################
+
+UNIMATCH_GIT = "https://github.com/autonomousvision/unimatch"
+UNIMATCH_REPO_DIR = "unimatch.gen"
+UNIMATCH_DIR = "unimatch"
+UNIMATCH_UTILS_DIR = "unimatch_utils"
 
 @setup_subparser()
 @deps([UNIMATCH_DIR, UNIMATCH_UTILS_DIR], [])
 def tool_unimatch_setup():
-  proc('git', 'clone', UNIMATCH_GIT, UNIMATCH_REPO_DIR)
-  shutil.copytree(osp.join(UNIMATCH_REPO_DIR, 'unimatch'), UNIMATCH_DIR)
-  shutil.copytree(osp.join(UNIMATCH_REPO_DIR, 'utils'), UNIMATCH_UTILS_DIR)
+  proc("git", "clone", UNIMATCH_GIT, UNIMATCH_REPO_DIR)
+  shutil.copytree(osp.join(UNIMATCH_REPO_DIR, "unimatch"), UNIMATCH_DIR)
+  shutil.copytree(osp.join(UNIMATCH_REPO_DIR, "utils"), UNIMATCH_UTILS_DIR)
 
 # Model zoo is here
 # https://github.com/autonomousvision/unimatch/blob/master/MODEL_ZOO.md
@@ -53,47 +134,49 @@ def tool_unimatch_setup():
 def subparser(subparser: ArgumentParser):
   arg = subparser.add_argument
 
-  arg('image0', type=Path)
-  arg('image1', type=Path)
+  arg("image0", type=Path)
+  arg("image1", type=Path)
 
-  arg('-o', '--output', type=str)
-  arg('-of', '--output-format', type=str, choices=['image', 'raw'], default='image')
-  arg('-ow', '--output-warped', action='store_true')
+  arg("-o", "--output", type=str)
+  arg("-of", "--output-format", type=str, choices=["image", "raw"], default="image")
+  arg("-ow", "--output-warped", action="store_true")
 
-  arg('-c', '--checkpoint', type=str, required=True)
+  arg("-c", "--checkpoint", type=str, required=True)
 
-  arg('--padding-factor', default=16, type=int,
-      help='the input should be divisible by padding_factor, otherwise do padding or resizing')
-  arg('--infer-scale', default=1, type=float)
+  arg("--image-scale", default=1, type=float)
 
-  arg('--task', default='flow', choices=['flow', 'stereo', 'depth'], type=str)
-  arg('--num-scales', default=1, type=int,
-      help='feature scales: 1/8 or 1/8 + 1/4')
-  arg('--feature-channels', default=128, type=int)
-  arg('--upsample-factor', default=8, type=int)
-  arg('--num-head', default=1, type=int)
-  arg('--ffn-dim-expansion', default=4, type=int)
-  arg('--num-transformer-layers', default=6, type=int)
-  arg('--reg-refine', action='store_true',
-      help='optional task-specific local regression refinement')
+  arg("--padding-factor", default=16, type=int,
+      help="the input should be divisible by padding_factor, otherwise do padding or resizing")
+  arg("--flow-scale", default=1, type=float)
 
-  arg('--attn-type', default='swin', type=str,
-      help='attention function')
-  arg('--attn-splits-list', default=[2], type=int, nargs='+',
-      help='number of splits in attention')
-  arg('--corr-radius-list', default=[-1], type=int, nargs='+',
-      help='correlation radius for matching, -1 indicates global matching')
-  arg('--prop-radius-list', default=[-1], type=int, nargs='+',
-      help='self-attention radius for propagation, -1 indicates global attention')
-  arg('--num-reg-refine', default=1, type=int,
-      help='number of additional local regression refinement')
+  arg("--task", default="flow", choices=["flow", "stereo", "depth"], type=str)
+  arg("--num-scales", default=1, type=int,
+      help="feature scales: 1/8 or 1/8 + 1/4")
+  arg("--feature-channels", default=128, type=int)
+  arg("--upsample-factor", default=8, type=int)
+  arg("--num-head", default=1, type=int)
+  arg("--ffn-dim-expansion", default=4, type=int)
+  arg("--num-transformer-layers", default=6, type=int)
+  arg("--reg-refine", action="store_true",
+      help="optional task-specific local regression refinement")
+
+  arg("--attn-type", default="swin", type=str,
+      help="attention function")
+  arg("--attn-splits-list", default=[2], type=int, nargs="+",
+      help="number of splits in attention")
+  arg("--corr-radius-list", default=[-1], type=int, nargs="+",
+      help="correlation radius for matching, -1 indicates global matching")
+  arg("--prop-radius-list", default=[-1], type=int, nargs="+",
+      help="self-attention radius for propagation, -1 indicates global attention")
+  arg("--num-reg-refine", default=1, type=int,
+      help="number of additional local regression refinement")
 @subparser
 @deps([], [tool_unimatch_setup])
 def tool_unimatch_run():
   global parser_args
   pa = parser_args
 
-  device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
   # Initialize model
   model = UniMatch(
@@ -111,17 +194,38 @@ def tool_unimatch_run():
   # Load checkpoint
   checkpoint = resolve_local_path(pa.checkpoint)
   checkpoint = torch.load(checkpoint, map_location=device)
-  model.load_state_dict(checkpoint['model'])
+  model.load_state_dict(checkpoint["model"])
 
-  img0 = unimatch_load_img(pa.image0)
-  img1 = unimatch_load_img(pa.image1)
+  img0 = load_img(pa.image0, output_type=np.ndarray)
+  img1 = load_img(pa.image1, output_type=np.ndarray)
+
+  img0 = unimatch_load_img(img0)
+  img1 = unimatch_load_img(img1)
+
+  if pa.image_scale != 1:
+    img0 = F.interpolate(
+      img0.unsqueeze(0),
+      size=[round(a*pa.image_scale) for a in img0.shape[-2:]],
+      mode="bilinear",
+      align_corners=True,
+    ).squeeze(0)
+    img1 = F.interpolate(
+      img1.unsqueeze(0),
+      size=[round(a*pa.image_scale) for a in img1.shape[-2:]],
+      mode="bilinear",
+      align_corners=True,
+    ).squeeze(0)
 
   trans_fn, restore_fn = unimatch_get_transform(
     [img0, img1],
-    infer_scale=pa.infer_scale,
+    flow_scale=pa.flow_scale,
     padding_factor=pa.padding_factor,
   )
 
+  Image.fromarray(img0.permute(1, 2, 0).to(torch.uint8).numpy()).show()
+  Image.fromarray(img1.permute(1, 2, 0).to(torch.uint8).numpy()).show()
+
+  logger.info("Running model...")
   with torch.no_grad():
     results_dict = model(
       # Backward flow
@@ -137,10 +241,10 @@ def tool_unimatch_run():
       corr_radius_list=pa.corr_radius_list,
       prop_radius_list=pa.prop_radius_list,
       num_reg_refine=pa.num_reg_refine,
-      task='flow',
+      task="flow",
     )
 
-  flow = results_dict['flow_preds'][-1]  # [B, 2, H, W]
+  flow = results_dict["flow_preds"][-1]  # [B, 2, H, W]
   flow = flow.squeeze(0)
   flow = restore_fn(flow, scale_flow=True)  # [2, H, W]
 
@@ -163,21 +267,96 @@ def tool_unimatch_run():
 
   # Present output
   match pa.output_format:
-    case 'raw':
+    case "raw":
       if pa.output is None:
-        raise RuntimeError(f'Must pass output file for {parser_args.output_format=}')
+        raise RuntimeError(f"Must pass output file for {parser_args.output_format=}")
       torch.save(flow, pa.output)
-    case 'image':
+    case "image":
       flow = flow_to_image_hue(flow)
       if pa.output is None:
         flow.show()
       else:
-        flow.save(pa.output)
+        flow.save(pa.output, exif=flow.getexif())
+
+############################################################
+#                        Nersemble                         #
+############################################################
+
+NERSEMBLE_DATA_GIT = "https://github.com/tobias-kirschstein/nersemble-data"
+NERSEMBLE_DATA_REPO_DIR = "nersemble-data.gen"
+NERSEMBLE_DATA_PATH = osp.join(NERSEMBLE_DATA_REPO_DIR, ".venv", "bin", "nersemble-data")
+
+if not IN_COLAB:
+  deps_out = [NERSEMBLE_DATA_PATH]
+else:
+  deps_out = []
+
+@setup_subparser()
+@deps(deps_out, [])
+def tool_nersemble_data_setup():
+  with deps.outer, deps([NERSEMBLE_DATA_REPO_DIR], []):
+    proc("git", "clone", NERSEMBLE_DATA_GIT, NERSEMBLE_DATA_REPO_DIR)
+  with ctl.chdir(NERSEMBLE_DATA_REPO_DIR):
+    if not IN_COLAB:
+      proc("python3", "-m", "venv", ".venv")
+      proc(osp.join(".venv", "bin", "pip"), "install", ".")
+    else:
+      # NOTE(andrei): Venv doesn't seem to work in Colab, so just installing it
+      # raw.
+      proc("pip", "install", ".")
+
+@setup_subparser
+def subparser(subparser: ArgumentParser):
+  # NOTE(andrei): This is not ideal but whatever.
+  subparser.add_argument("args", nargs=argparse.REMAINDER)
+@subparser
+@deps([], [tool_nersemble_data_setup])
+def tool_nersemble_data():
+  if not IN_COLAB:
+    proc(NERSEMBLE_DATA_PATH, *parser_args.args, check=False)
+  else:
+    proc("nersemble-data", *parser_args.args, check=False)
+
+############################################################
+#                           Flow                           #
+############################################################
+
+@setup_subparser
+def subparser(subparser: ArgumentParser):
+  arg = subparser.add_argument
+  arg("image", type=Path)
+  arg("flow", type=Path)
+@subparser
+def tool_flow_warp():
+  flow = image_to_flow_hue(parser_args.flow)
+  flow = torch.from_numpy(flow).permute(2, 0, 1).unsqueeze(0)
+
+  image = load_img(parser_args.image)
+  image = image.permute(2, 0, 1).unsqueeze(0)
+  image = F.interpolate(
+    image,
+    size=flow.shape[-2:],
+    mode="bilinear",
+    align_corners=True,
+  )
+
+  print(image.shape)
+  print(flow.shape)
+
+  Image.fromarray(image.squeeze(0).permute(1, 2, 0).to(torch.uint8).numpy()).show()
+
+  image_warped = flow_warp(
+    image.float(),
+    flow.float(),
+  )
+
+  image_warped = image_warped.round().clip(0, 255).to(torch.uint8)
+  Image.fromarray(image_warped.squeeze(0).permute(1, 2, 0).to(torch.uint8).numpy()).show()
 
 @setup_subparser
 def subparser(subparser: ArgumentParser):  # pylint: disable=E0102
   arg = subparser.add_argument
-  arg('--radius', type=int, default=500)
+  arg("--radius", type=int, default=500)
 @subparser
 def tool_flow_wheel():
   space = np.linspace(-1, 1, num=parser_args.radius)
@@ -188,28 +367,11 @@ def tool_flow_wheel():
   flow[mag > 1, :] = 0
   flow_to_image_hue(flow).show()
 
-NERSEMBLE_DATA_GIT = 'https://github.com/tobias-kirschstein/nersemble-data'
-NERSEMBLE_DATA_REPO_DIR = 'nersemble-data.gen'
-NERSEMBLE_DATA_PATH = osp.join(NERSEMBLE_DATA_REPO_DIR, '.venv', 'bin', 'nersemble-data')
+############################################################
+#                           Main                           #
+############################################################
 
-@setup_subparser()
-@deps([NERSEMBLE_DATA_PATH], [])
-def tool_nersemble_data_setup():
-  proc('git', 'clone', NERSEMBLE_DATA_GIT, NERSEMBLE_DATA_REPO_DIR)
-  with ctl.chdir(NERSEMBLE_DATA_REPO_DIR):
-    proc('python3', '-m', 'venv', '.venv')
-    proc(osp.join('.venv', 'bin', 'pip'), 'install', '.')
-
-@setup_subparser
-def subparser(subparser: ArgumentParser):
-  # NOTE(andrei): This is not ideal but whatever.
-  subparser.add_argument('args', nargs=argparse.REMAINDER)
-@subparser
-@deps([], [tool_nersemble_data_setup])
-def tool_nersemble_data():
-  proc(NERSEMBLE_DATA_PATH, *parser_args.args, check=False)
-
-if __name__ == '__main__':
+if __name__ == "__main__":
   logging.basicConfig(level=logging.INFO)
   parser_args = parser.parse_args()
   parser_args.fn()
