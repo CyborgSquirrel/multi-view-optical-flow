@@ -9,13 +9,16 @@ import zipfile
 from argparse import ArgumentParser
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Self
 from zipfile import ZipFile
 
 import humanize
+import json5
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from pydantic import BaseModel
 
 from colab_util import IN_COLAB
 from ml_util import (flow_to_image_hue, forward_warp, image_to_flow_hue,
@@ -43,6 +46,34 @@ IS_NIXOS = osp.exists("/nix")
 if IS_NIXOS:
   os.environ["LD_LIBRARY_PATH"] = os.environ["NIX_LD_LIBRARY_PATH"]
 
+############################################################
+#                          Config                          #
+############################################################
+
+class Config(BaseModel):
+  DEPLOY_PATH: Path = Path("put-the-directory-where-code-will-be-deployed-here")
+
+  @classmethod
+  def get(cls) -> Self:
+    path = osp.join(REPO_ROOT, "config.json5")
+
+    if not osp.exists(path):
+      logger.warning("Config does not exist, generating default at %r...", path)
+      config = cls()
+      with open(path, "w") as f:
+        json5.dump(config.model_dump(mode="json"), f, indent=2)
+
+    with open(path) as f:
+      config = json5.load(f)
+    config = cls.model_validate(config)
+    return config
+
+cfg = Config.get()
+
+############################################################
+#                     Commandline Args                     #
+############################################################
+
 parser = ArgumentParser()
 subparsers = parser.add_subparsers(dest="action", required=True)
 setup_subparser = make_setup_subparser(subparsers)
@@ -50,8 +81,6 @@ setup_subparser = make_setup_subparser(subparsers)
 ############################################################
 #                          Colab                           #
 ############################################################
-
-GDRIVE_DEST = Path("/home/andrei/gdrive/adl4cv")
 
 @ft.cache
 def get_file_paths():
@@ -95,7 +124,7 @@ def write_ar_code(dst: str | Path):
 @setup_subparser()
 def tool_deploy_code():
   logger.info("Making sure project directory exists...")
-  GDRIVE_DEST.mkdir(parents=True, exist_ok=True)
+  cfg.DEPLOY_PATH.mkdir(parents=True, exist_ok=True)
 
   with TemporaryDirectory() as tmp_dir:
     tmp_dir = Path(tmp_dir)
@@ -104,12 +133,12 @@ def tool_deploy_code():
     write_ar_code(ar_path)
 
     logger.info("Uploading code archive...")
-    shutil.move(ar_path, GDRIVE_DEST / ar_path.name)
+    shutil.move(ar_path, cfg.DEPLOY_PATH / ar_path.name)
 
 @setup_subparser()
 def tool_deploy_nb():
-  GDRIVE_DEST.mkdir(parents=True, exist_ok=True)
-  shutil.copy("main.ipynb", GDRIVE_DEST)
+  cfg.DEPLOY_PATH.mkdir(parents=True, exist_ok=True)
+  shutil.copy("main.ipynb", cfg.DEPLOY_PATH)
 
 ############################################################
 #                         Unimatch                         #
