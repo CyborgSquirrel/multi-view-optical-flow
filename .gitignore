@@ -2,6 +2,10 @@
 *.gen
 *.gen.*
 
+# secrets
+*.secret
+*.secret.*
+
 # Python
 __pycache__/
 .venv/
@@ -16,6 +20,9 @@ config.json5
 *.zip
 unimatch/
 unimatch_utils/
-nersemble/
+nersemble-data/
+nersemble-models/
 
 experiments/
+
+# !nersemble.gen/

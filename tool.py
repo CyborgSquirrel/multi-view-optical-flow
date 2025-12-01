@@ -7,9 +7,10 @@ import random
 import shutil
 import zipfile
 from argparse import ArgumentParser
+from collections import ChainMap
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Self
+from typing import ClassVar, Optional, Self
 from zipfile import ZipFile
 
 import humanize
@@ -19,8 +20,9 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from pydantic import BaseModel
+from tqdm import tqdm
 
-from colab_util import IN_COLAB
+from colab_util import IN_COLAB, PROJECT_PATH
 from ml_util import (flow_to_image_hue, forward_warp, image_to_flow_hue,
                      load_img, unimatch_get_transform, unimatch_load_img)
 from util import deps, make_setup_subparser, osp, proc, resolve_local_path
@@ -50,25 +52,34 @@ if IS_NIXOS:
 #                          Config                          #
 ############################################################
 
-class Config(BaseModel):
-  DEPLOY_PATH: Path = Path("put-the-directory-where-code-will-be-deployed-here")
+class BaseConfig(BaseModel):
+  PATH: ClassVar[str]
 
   @classmethod
   def get(cls) -> Self:
-    path = osp.join(REPO_ROOT, "config.json5")
+    if not osp.exists(cls.PATH):
+      logger.warning("Config does not exist, generating default at %r...", cls.PATH)
+      obj = cls()
+      with open(cls.PATH, "w") as f:
+        json5.dump(obj.model_dump(mode="json"), f, indent=2)
 
-    if not osp.exists(path):
-      logger.warning("Config does not exist, generating default at %r...", path)
-      config = cls()
-      with open(path, "w") as f:
-        json5.dump(config.model_dump(mode="json"), f, indent=2)
+    with open(cls.PATH) as f:
+      obj = json5.load(f)
+    obj = cls.model_validate(obj)
+    return obj
 
-    with open(path) as f:
-      config = json5.load(f)
-    config = cls.model_validate(config)
-    return config
+class Config(BaseConfig):
+  PATH = osp.join(REPO_ROOT, "config.json5")
+
+  DEPLOY_PATH: Optional[Path] = None
+
+class Secrets(BaseConfig):
+  PATH = osp.join(REPO_ROOT, "config.secret.json5")
+
+  NERSEMBLE_DATA_URL: Optional[str] = None
 
 cfg = Config.get()
+sec = Secrets.get()
 
 ############################################################
 #                     Commandline Args                     #
@@ -109,10 +120,10 @@ def write_ar_code(dst: str | Path):
   file_paths = get_file_paths()
   with ZipFile(dst, "w", compression=zipfile.ZIP_DEFLATED) as z:
     code_id = random.randbytes(4).hex()
-    logger.info("Setting code archive id to %r...", code_id)
+    logger.info("Setting code archive ID to %r...", code_id)
     z.writestr(osp.join(dir_name, "id.txt"), code_id)
 
-    for file_path in file_paths:
+    for file_path in tqdm(file_paths, desc="Zipping files..."):
       z.write(
         file_path,
         osp.join(dir_name, file_path),
@@ -139,6 +150,11 @@ def tool_deploy_code():
 def tool_deploy_nb():
   cfg.DEPLOY_PATH.mkdir(parents=True, exist_ok=True)
   shutil.copy("main.ipynb", cfg.DEPLOY_PATH)
+
+@setup_subparser()
+def tool_deploy_secrets():
+  cfg.DEPLOY_PATH.mkdir(parents=True, exist_ok=True)
+  shutil.copy(sec.PATH, cfg.DEPLOY_PATH)
 
 ############################################################
 #                         Unimatch                         #
@@ -308,12 +324,14 @@ def tool_unimatch_run():
         flow.save(pa.output, exif=flow.getexif())
 
 ############################################################
-#                        Nersemble                         #
+#                      Nersemble Data                      #
 ############################################################
 
 NERSEMBLE_DATA_GIT = "https://github.com/tobias-kirschstein/nersemble-data"
-NERSEMBLE_DATA_REPO_DIR = "nersemble-data.gen"
+NERSEMBLE_DATA_REPO_DIR = "nersemble-data-tool.gen"
 NERSEMBLE_DATA_PATH = osp.join(NERSEMBLE_DATA_REPO_DIR, ".venv", "bin", "nersemble-data")
+
+NERSEMBLE_DATA_ENV_PATH = Path.home() / ".config" / "nersemble_data" / ".env"
 
 if not IN_COLAB:
   deps_out = [NERSEMBLE_DATA_PATH]
@@ -325,6 +343,12 @@ else:
 def tool_nersemble_data_setup():
   with deps.outer, deps([NERSEMBLE_DATA_REPO_DIR], []):
     proc("git", "clone", NERSEMBLE_DATA_GIT, NERSEMBLE_DATA_REPO_DIR)
+
+  if sec.NERSEMBLE_DATA_URL is not None:
+    NERSEMBLE_DATA_ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with NERSEMBLE_DATA_ENV_PATH.open("w") as f:
+      f.write(f"NERSEMBLE_DATA_URL=\"{sec.NERSEMBLE_DATA_URL}\"\n")
+
   with ctl.chdir(NERSEMBLE_DATA_REPO_DIR):
     if not IN_COLAB:
       proc("python3", "-m", "venv", ".venv")
@@ -345,6 +369,35 @@ def tool_nersemble_data():
     proc(NERSEMBLE_DATA_PATH, *parser_args.args, check=False)
   else:
     proc("nersemble-data", *parser_args.args, check=False)
+
+############################################################
+#                        Nersemble                         #
+############################################################
+
+# !curl --progress-bar 'https://nextcloud.tobias-kirschstein.de/index.php/s/gQoLTHjQkNNHN2j/download?path=%2FNERS-9018' > 'NERS-9018-x.zip'
+
+# NOTE(andrei): Using my fork to escape Conda.
+# NERSEMBLE_GIT = "https://github.com/tobias-kirschstein/nersemble"
+NERSEMBLE_GIT = "https://github.com/CyborgSquirrel/nersemble"
+NERSEMBLE_REPO_DIR = "nersemble.gen"
+
+@setup_subparser()
+@deps([], [])
+def tool_nersemble_setup():
+  with deps.outer, deps([NERSEMBLE_REPO_DIR], [], name="nersemble_clone"):
+    # NOTE(andrei): Using --depth 1 because otherwise it takes ages.
+    proc("git", "clone", "--depth", "1", NERSEMBLE_GIT, NERSEMBLE_REPO_DIR)
+
+  if IN_COLAB:
+    # Grab pre-built tinycudann
+    name = "tinycudann-2.0-cp312-cp312-linux_x86_64.whl"
+    src = osp.join(PROJECT_PATH, name)
+    dst = osp.join(NERSEMBLE_REPO_DIR, name)
+    with deps.outer, deps([dst], [src]):
+      shutil.copy(src, dst)
+
+  with ctl.chdir(NERSEMBLE_REPO_DIR):
+    proc("./install.sh")
 
 ############################################################
 #                           Flow                           #
