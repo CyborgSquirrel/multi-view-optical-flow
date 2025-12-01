@@ -244,8 +244,8 @@ def tool_unimatch_run():
   img0 = load_img(pa.image0, output_type=np.ndarray)
   img1 = load_img(pa.image1, output_type=np.ndarray)
 
-  img0 = unimatch_load_img(img0)
-  img1 = unimatch_load_img(img1)
+  img0 = unimatch_load_img(img0).to(device)
+  img1 = unimatch_load_img(img1).to(device)
 
   if pa.image_scale != 1:
     img0 = F.interpolate(
@@ -267,8 +267,8 @@ def tool_unimatch_run():
     padding_factor=pa.padding_factor,
   )
 
-  Image.fromarray(img0.permute(1, 2, 0).to(torch.uint8).numpy()).show()
-  Image.fromarray(img1.permute(1, 2, 0).to(torch.uint8).numpy()).show()
+  Image.fromarray(img0.permute(1, 2, 0).to(torch.uint8).cpu().numpy()).show()
+  Image.fromarray(img1.permute(1, 2, 0).to(torch.uint8).cpu().numpy()).show()
 
   logger.info("Running model...")
   with torch.no_grad():
