@@ -1,3 +1,4 @@
+import abc
 import dataclasses as dc
 import logging
 import re
@@ -256,17 +257,55 @@ def test_rgb_hsv_conversion():
   rgb_roundtrip = hsv_to_rgb(hsv)
   assert np.all(np.isclose(rgb, rgb_roundtrip))
 
-@dc.dataclass
-class FlowExif:
-  mag_max: float
+# Taken from here https://github.com/lizhihao6/Forward-Warp
+def forward_warp(im0, flow, interpolation_mode):
+  im0 = im0.to(torch.float32)
+  im1 = torch.zeros_like(im0)
+  B = im0.shape[0]
+  H = im0.shape[2]
+  W = im0.shape[3]
+  if interpolation_mode == 0:
+    for b in range(B):
+      for h in range(H):
+        for w in range(W):
+          x = w + flow[b, h, w, 0]
+          y = h + flow[b, h, w, 1]
+          nw = (int(torch.floor(x)), int(torch.floor(y)))
+          ne = (nw[0]+1, nw[1])
+          sw = (nw[0], nw[1]+1)
+          se = (nw[0]+1, nw[1]+1)
+          p = im0[b, :, h, w]
 
-  STRUCT_FMT: ClassVar = ">d"
+          if nw[0] >= 0 and se[0] < W and nw[1] >= 0 and se[1] < H:
+            nw_k = (se[0]-x)*(se[1]-y)
+            ne_k = (x-sw[0])*(sw[1]-y)
+            sw_k = (ne[0]-x)*(y-ne[1])
+            se_k = (x-nw[0])*(y-nw[1])
+            im1[b, :, nw[1], nw[0]] += nw_k*p
+            im1[b, :, ne[1], ne[0]] += ne_k*p
+            im1[b, :, sw[1], sw[0]] += sw_k*p
+            im1[b, :, se[1], se[0]] += se_k*p
+  else:
+    round_flow = torch.round(flow)
+    for b in range(B):
+      for h in range(H):
+        for w in range(W):
+          x = w + int(round_flow[b, h, w, 0])
+          y = h + int(round_flow[b, h, w, 1])
+          if x >= 0 and x < W and y >= 0 and y < H:
+            im1[b, :, y, x] = im0[b, :, h, w]
+  im1 = torch.clip(im1, 0, 255)
+  return im1
+
+@dc.dataclass
+class MetaExif(abc.ABC):
+  @abc.abstractmethod
   def exif_encode(self) -> bytes:
-    return struct.pack(self.STRUCT_FMT, self.mag_max)
+    ...
   @classmethod
+  @abc.abstractmethod
   def exif_decode(cls, src: bytes) -> Self:
-    mag_max, = struct.unpack(cls.STRUCT_FMT, src)
-    return cls(mag_max)
+    ...
 
   def img_write(self, img: Image.Image):
     exif = img.getexif()
@@ -276,6 +315,22 @@ class FlowExif:
     exif = img.getexif()
     exif_data = exif[ExifTags.IFD.MakerNote]
     return cls.exif_decode(exif_data)
+
+############################################################
+#                      HSV Flow Image                      #
+############################################################
+
+@dc.dataclass
+class FlowExif(MetaExif):
+  mag_max: float
+
+  STRUCT_FMT: ClassVar = ">d"
+  def exif_encode(self) -> bytes:
+    return struct.pack(self.STRUCT_FMT, self.mag_max)
+  @classmethod
+  def exif_decode(cls, src: bytes) -> Self:
+    mag_max, = struct.unpack(cls.STRUCT_FMT, src)
+    return cls(mag_max)
 
 def flow_to_image_hue(
   # [H, W, 2]
@@ -320,7 +375,9 @@ def flow_to_image_hue(
   return flow
 
 # [H, W, 2]
-def image_to_flow_hue(img: str | Path | Image.Image) -> np.ndarray:
+def image_to_flow_hue(
+  img: str | Path | Image.Image
+) -> np.ndarray:
   if isinstance(img, str):
     img = Path(img)
   if isinstance(img, Path):
@@ -367,42 +424,79 @@ def test_image_flow_hue_conversion():
   test_case(rad=100, mag=5, atol=0.05)
   test_case(rad=100, mag=100, atol=0.75)
 
-# Taken from here https://github.com/lizhihao6/Forward-Warp
-def forward_warp(im0, flow, interpolation_mode):
-  im0 = im0.to(torch.float32)
-  im1 = torch.zeros_like(im0)
-  B = im0.shape[0]
-  H = im0.shape[2]
-  W = im0.shape[3]
-  if interpolation_mode == 0:
-    for b in range(B):
-      for h in range(H):
-        for w in range(W):
-          x = w + flow[b, h, w, 0]
-          y = h + flow[b, h, w, 1]
-          nw = (int(torch.floor(x)), int(torch.floor(y)))
-          ne = (nw[0]+1, nw[1])
-          sw = (nw[0], nw[1]+1)
-          se = (nw[0]+1, nw[1]+1)
-          p = im0[b, :, h, w]
+############################################################
+#                       Depth Image                        #
+############################################################
 
-          if nw[0] >= 0 and se[0] < W and nw[1] >= 0 and se[1] < H:
-            nw_k = (se[0]-x)*(se[1]-y)
-            ne_k = (x-sw[0])*(sw[1]-y)
-            sw_k = (ne[0]-x)*(y-ne[1])
-            se_k = (x-nw[0])*(y-nw[1])
-            im1[b, :, nw[1], nw[0]] += nw_k*p
-            im1[b, :, ne[1], ne[0]] += ne_k*p
-            im1[b, :, sw[1], sw[0]] += sw_k*p
-            im1[b, :, se[1], se[0]] += se_k*p
-  else:
-    round_flow = torch.round(flow)
-    for b in range(B):
-      for h in range(H):
-        for w in range(W):
-          x = w + int(round_flow[b, h, w, 0])
-          y = h + int(round_flow[b, h, w, 1])
-          if x >= 0 and x < W and y >= 0 and y < H:
-            im1[b, :, y, x] = im0[b, :, h, w]
-  im1 = torch.clip(im1, 0, 255)
-  return im1
+@dc.dataclass
+class DepthExif(MetaExif):
+  mag_max: float
+
+  STRUCT_FMT: ClassVar = ">d"
+  def exif_encode(self) -> bytes:
+    return struct.pack(self.STRUCT_FMT, self.mag_max)
+  @classmethod
+  def exif_decode(cls, src: bytes) -> Self:
+    mag_max, = struct.unpack(cls.STRUCT_FMT, src)
+    return cls(mag_max)
+
+def depth_to_image(
+  # [H, W, 1]
+  depth: torch.Tensor | np.ndarray,
+  *,
+  exif: bool = True,
+  mag_max: Optional[float] = None,
+):
+  with_exif = exif
+  del exif
+
+  shape = tuple(depth.shape)
+  match shape:
+    case (_h, _w): pass
+    case (_h, _w, 1):
+      depth = depth[..., 0]
+    case _: raise TypeError(f"Unexpected {shape=}")
+
+  if isinstance(depth, torch.Tensor):
+    depth = depth.cpu().numpy()
+
+  if mag_max is None:
+    mag_max = np.max(depth)
+
+  depth = depth / mag_max
+  depth = np.clip(depth * 255, 0, 255).astype(np.uint8)
+
+  depth = Image.fromarray(depth)
+
+  if with_exif:
+    exif = DepthExif(mag_max)
+    exif.img_write(depth)
+
+  return depth
+
+# [H, W, 1]
+def image_to_depth(
+  img: str | Path | Image.Image,
+) -> np.ndarray:
+  if isinstance(img, str):
+    img = Path(img)
+  if isinstance(img, Path):
+    img = Image.open(img)
+  if isinstance(img, Image.Image):
+    exif = DepthExif.img_read(img)
+
+    img: np.ndarray
+    img = np.asarray(img)
+    img = img.astype(np.float64)
+    img = img / 255
+    img = img * exif.mag_max
+
+    return img
+  raise RuntimeError(f"Unexpected {type(img)=}")
+
+def test_image_depth_conversion():
+  depth = np.linspace(0, 50, num=100*100).reshape(100, 100)
+  depth_img = depth_to_image(depth)
+  depth_roundtrip = image_to_depth(depth_img)
+
+  assert np.all(np.isclose(depth, depth_roundtrip, atol=0.25))

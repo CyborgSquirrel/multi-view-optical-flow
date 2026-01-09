@@ -1,6 +1,7 @@
 import argparse
 import contextlib as ctl
 import functools as ft
+import itertools as itt
 import logging
 import os
 import random
@@ -14,17 +15,17 @@ from typing import ClassVar, Optional, Self
 from zipfile import ZipFile
 
 import humanize
+import imageio as iio
 import json5
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
-from pydantic import BaseModel
-from tqdm import tqdm
-
 from colab_util import IN_COLAB, PROJECT_PATH
 from ml_util import (flow_to_image_hue, forward_warp, image_to_flow_hue,
                      load_img, unimatch_get_transform, unimatch_load_img)
+from PIL import Image
+from pydantic import BaseModel
+from tqdm import tqdm
 from util import deps, make_setup_subparser, osp, proc, resolve_local_path
 
 logger = logging.getLogger(__name__)
@@ -400,6 +401,46 @@ def tool_nersemble_setup():
     proc("./install.sh")
 
 ############################################################
+#                           Misc                           #
+############################################################
+
+@setup_subparser
+def subparser(subparser: ArgumentParser):
+  arg = subparser.add_argument
+  arg("image", type=Path)
+@subparser
+def tool_img_show():
+  image = load_img(parser_args.image)
+  Image.fromarray(image.to(torch.uint8).numpy()).show()
+
+@setup_subparser
+def subparser(subparser: ArgumentParser):
+  arg = subparser.add_argument
+  arg("vid0", type=Path)
+  arg("vid1", type=Path)
+  arg("output", type=Path)
+@subparser
+def tool_vid_diff():
+  from skimage.transform import resize
+  from tqdm import tqdm
+
+  vid0_iter = iio.imiter(parser_args.vid0, plugin="pyav")
+  vid1_iter = iio.imiter(parser_args.vid1, plugin="pyav")
+
+  with ctl.closing(iio.get_writer(parser_args.output, fps=73)) as output_writer:
+    for fr0, fr1 in tqdm(zip(vid0_iter, vid1_iter)):
+      h = min(fr0.shape[0], fr1.shape[0])
+      w = min(fr0.shape[1], fr1.shape[1])
+
+      fr0 = resize(fr0, (h, w))
+      fr1 = resize(fr1, (h, w))
+
+      err = np.abs(fr0 - fr1)
+      err = np.mean(err, axis=-1)
+      err = np.clip(err, 0, 255)
+      output_writer.append_data(err)
+
+############################################################
 #                           Flow                           #
 ############################################################
 
@@ -408,10 +449,13 @@ def subparser(subparser: ArgumentParser):
   arg = subparser.add_argument
   arg("image", type=Path)
   arg("flow", type=Path)
+  arg("--flow-mul", type=float, default=1)
+  arg("-o", "--output", type=str)
 @subparser
 def tool_flow_warp():
   flow = image_to_flow_hue(parser_args.flow)
   flow = torch.from_numpy(flow).permute(2, 0, 1).unsqueeze(0)
+  flow = flow * parser_args.flow_mul
 
   image = load_img(parser_args.image)
   image = image.permute(2, 0, 1).unsqueeze(0)
@@ -422,10 +466,8 @@ def tool_flow_warp():
     align_corners=True,
   )
 
-  print(image.shape)
-  print(flow.shape)
-
-  Image.fromarray(image.squeeze(0).permute(1, 2, 0).to(torch.uint8).numpy()).show()
+  if parser_args.output is None:
+    Image.fromarray(image.squeeze(0).permute(1, 2, 0).to(torch.uint8).numpy()).show()
 
   image_warped = flow_warp(
     image.float(),
@@ -433,7 +475,12 @@ def tool_flow_warp():
   )
 
   image_warped = image_warped.round().clip(0, 255).to(torch.uint8)
-  Image.fromarray(image_warped.squeeze(0).permute(1, 2, 0).to(torch.uint8).numpy()).show()
+  image_warped = Image.fromarray(image_warped.squeeze(0).permute(1, 2, 0).to(torch.uint8).numpy())
+
+  if parser_args.output is None:
+    image_warped.show()
+  else:
+    image_warped.save(parser_args.output)
 
 @setup_subparser
 def subparser(subparser: ArgumentParser):  # pylint: disable=E0102
