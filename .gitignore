@@ -24,3 +24,7 @@ nersemble-data/
 nersemble-models/
 
 experiments/
+
+*.png
+*.tiff
+*.ply

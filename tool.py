@@ -20,12 +20,14 @@ import json5
 import numpy as np
 import torch
 import torch.nn.functional as F
-from colab_util import IN_COLAB, PROJECT_PATH
-from ml_util import (flow_to_image_hue, forward_warp, image_to_flow_hue,
-                     load_img, unimatch_get_transform, unimatch_load_img)
 from PIL import Image
 from pydantic import BaseModel
 from tqdm import tqdm
+
+from colab_util import IN_COLAB, PROJECT_PATH
+from ml_util import (FlowExif, flow_to_image_hue, forward_warp,
+                     image_to_flow_hue, load_img, unimatch_get_transform,
+                     unimatch_load_img)
 from util import deps, make_setup_subparser, osp, proc, resolve_local_path
 
 logger = logging.getLogger(__name__)
@@ -443,6 +445,47 @@ def tool_vid_diff():
 ############################################################
 #                           Flow                           #
 ############################################################
+
+@setup_subparser
+def subparser(subparser: ArgumentParser):
+  arg = subparser.add_argument
+  arg("flow", type=Path, nargs="+")
+@subparser
+def tool_flow_read_mag():
+  mag_max = None
+  for flow in tqdm(parser_args.flow):
+    img = Image.open(flow)
+    exif = FlowExif.img_read(img)
+    if mag_max is None:
+      mag_max = exif.mag_max
+    else:
+      mag_max = max(mag_max, exif.mag_max)
+  print(f"{mag_max=}")
+
+@setup_subparser
+def subparser(subparser: ArgumentParser):
+  arg = subparser.add_argument
+  arg("output", type=Path)
+  arg("flow", type=Path, nargs="+")
+@subparser
+def tool_flow_norm_mag():
+  mag_max = None
+  for flow_path in tqdm(parser_args.flow, desc="Calculating maximum magnitude"):
+    img = Image.open(flow_path)
+    exif = FlowExif.img_read(img)
+    if mag_max is None:
+      mag_max = exif.mag_max
+    else:
+      mag_max = max(mag_max, exif.mag_max)
+  logger.info("Calculated mag_max=%r", mag_max)
+
+  for flow_path in tqdm(parser_args.flow, desc="Writing normalized flows"):
+    flow = image_to_flow_hue(Image.open(flow_path))
+    img = flow_to_image_hue(flow, mag_max=mag_max)
+    output_path = osp.join(parser_args.output, osp.basename(flow_path))
+    if osp.exists(output_path):
+      logger.warning("Overwriting %r...", output_path)
+    img.save(output_path, exif=img.getexif())
 
 @setup_subparser
 def subparser(subparser: ArgumentParser):

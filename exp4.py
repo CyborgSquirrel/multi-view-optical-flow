@@ -1,3 +1,5 @@
+"""Combine images into a single pointcloud"""
+
 import json
 
 import numpy as np
@@ -15,8 +17,7 @@ from ml_util import image_to_depth, load_img
 # 220700191 221501007 222200036 222200037 222200038 222200039 222200040 222200041 222200042 222200043 222200044 222200045 222200046 222200047 222200048 222200049
 
 FRAME_PATH_FMT = "./nersemble-data/018/sequences/EMO-1-shout+laugh/images/cam_{pose}.mp4:{frame}"
-# DEPTH_PATH_FMT = "/media/andrei/gdrive/adl4cv/nersemble-out/NERS-9018_{pose}_depth-{frame}_checkpoint-300000.png"
-DEPTH_PATH_FMT = "./depth/NERS-9018_{pose}_depth-{frame}_checkpoint-300000.png"
+DEPTH_PATH_FMT = "./depth/NERS-9018_{pose}_depth-{frame}_checkpoint-300000.tiff"
 BG_PATH_FMT = "./nersemble-data/018/sequences/BACKGROUND/image_{pose}.jpg"
 
 CAMERA_PARAMS_PATH = "/home/andrei/adl4cv-project/nersemble-data/018/calibration/camera_params.json"
@@ -37,8 +38,8 @@ def main():
 		"222200038",
 		"222200039",
 		"222200040",
-		"222200041",
-		"222200042",
+		# "222200041",
+		# "222200042",
 	]
 
 	for pose in tqdm(poses):
@@ -57,8 +58,6 @@ def main():
 		  camera_coordinate_convention=CameraCoordinateConvention.OPEN_CV,
 		)
 		pose.change_pose_type(PoseType.CAM_2_WORLD)
-		# pose.change_camera_coordinate_convention(CameraCoordinateConvention.OPEN_GL)
-		pose.swap_axes(["x", "-z", "y"])
 		print(pose)
 
 		scale_factor = 9
@@ -70,6 +69,9 @@ def main():
 		# load images
 		frame = load_img(frame_path, output_type=np.ndarray)
 		depth = image_to_depth(depth_path)
+		# depth = torch.load(depth_path, map_location="cpu").numpy()[..., 0]
+		# low_depth = np.asarray(Image.open("/home/andrei/a.tiff")).view(np.float16)
+		# print(np.mean(np.abs(depth - low_depth)))
 		bg = load_img(bg_path, output_type=np.ndarray)
 
 		frame = resize(frame, depth.shape[:2], preserve_range=True)
@@ -84,7 +86,6 @@ def main():
 		# do the thing
 		h, w = depth.shape[:2]
 		mul = 4
-		# mul = 1
 		x, y = np.meshgrid(np.arange(w) * mul, np.arange(h) * mul)
 
 		xy = np.stack([x, y], axis=-1)
@@ -114,8 +115,6 @@ def main():
 
 		# xyz_all.append(xyz)
 		# rgb_all.append(rgb * 0.5)
-
-		# xyz = generate_sphere_points(1000, 10)
 
 		# apply pose
 		xyzh = np.concat([xyz, np.ones( xyz.shape[:-1] + (1,) )], axis=-1)

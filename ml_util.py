@@ -297,6 +297,26 @@ def forward_warp(im0, flow, interpolation_mode):
   im1 = torch.clip(im1, 0, 255)
   return im1
 
+def numpify(fn):
+  """Wrap a function expecting torch arrays to auto-convert inputs to torch and
+  outputs to numpy."""
+
+  def conv(value):
+    if isinstance(value, np.ndarray):
+      print(value.shape)
+      return torch.from_numpy(value)
+    return value
+
+  def wrapped(*args, **kwargs):
+    args = [ conv(val) for val in args ]
+    kwargs = { conv(key): conv(val) for key, val in kwargs.items() }
+    ret = fn(*args, **kwargs)
+    if isinstance(ret, torch.Tensor):
+      ret = ret.cpu().numpy()
+    return ret
+
+  return wrapped
+
 @dc.dataclass
 class MetaExif(abc.ABC):
   @abc.abstractmethod
@@ -332,6 +352,37 @@ class FlowExif(MetaExif):
     mag_max, = struct.unpack(cls.STRUCT_FMT, src)
     return cls(mag_max)
 
+def flow_to_hue_flow(
+  # [H, W, 2]
+  flow: torch.Tensor | np.ndarray,
+  *,
+  mag_max: Optional[float] = None,
+):
+  if isinstance(flow, torch.Tensor):
+    flow = flow.cpu().numpy()
+
+  shape = tuple(flow.shape)
+  if shape[-1] != 2:
+    raise TypeError(f"Unexpected {shape=}")
+
+  ang = np.atan2(flow[..., 1], flow[..., 0])
+  ang = (ang + np.pi) / (np.pi * 2)
+
+  mag = np.linalg.vector_norm(flow, axis=-1, ord=2)
+  if mag_max is None:
+    mag_max = np.max(mag).item()
+  mag = mag / mag_max
+  mag = np.clip(mag, 0, 1)
+
+  flow = np.stack([
+    ang,
+    mag,
+    np.ones(shape[:-1]),
+  ], axis=-1)
+  flow = hsv_to_rgb(flow)
+
+  return mag_max, flow
+
 def flow_to_image_hue(
   # [H, W, 2]
   flow: torch.Tensor | np.ndarray,
@@ -342,30 +393,8 @@ def flow_to_image_hue(
   with_exif = exif
   del exif
 
-  shape = tuple(flow.shape)
-  match shape:
-    case (_h, _w, 2): pass
-    case _: raise TypeError(f"Unexpected {shape=}")
-
-  if isinstance(flow, torch.Tensor):
-    flow = flow.cpu().numpy()
-
-  ang = np.atan2(flow[..., 1], flow[..., 0])
-  ang = (ang + np.pi) / (np.pi * 2)
-
-  mag = np.linalg.vector_norm(flow, axis=-1, ord=2)
-  if mag_max is None:
-    mag_max = np.max(mag).item()
-  mag = mag / mag_max
-
-  flow = np.stack([
-    ang,
-    mag,
-    np.ones(shape[:-1]),
-  ], axis=-1)
-  flow = hsv_to_rgb(flow)
+  mag_max, flow = flow_to_hue_flow(flow, mag_max=mag_max)
   flow = np.clip(flow * 255, 0, 255).astype(np.uint8)
-
   flow = Image.fromarray(flow)
 
   if with_exif:
@@ -428,28 +457,11 @@ def test_image_flow_hue_conversion():
 #                       Depth Image                        #
 ############################################################
 
-@dc.dataclass
-class DepthExif(MetaExif):
-  mag_max: float
-
-  STRUCT_FMT: ClassVar = ">d"
-  def exif_encode(self) -> bytes:
-    return struct.pack(self.STRUCT_FMT, self.mag_max)
-  @classmethod
-  def exif_decode(cls, src: bytes) -> Self:
-    mag_max, = struct.unpack(cls.STRUCT_FMT, src)
-    return cls(mag_max)
-
 def depth_to_image(
-  # [H, W, 1]
+  path: str | Path,
+  # [H, W] | [H, W, 1]
   depth: torch.Tensor | np.ndarray,
-  *,
-  exif: bool = True,
-  mag_max: Optional[float] = None,
 ):
-  with_exif = exif
-  del exif
-
   shape = tuple(depth.shape)
   match shape:
     case (_h, _w): pass
@@ -460,43 +472,39 @@ def depth_to_image(
   if isinstance(depth, torch.Tensor):
     depth = depth.cpu().numpy()
 
-  if mag_max is None:
-    mag_max = np.max(depth)
+  # NOTE: TIFF supports 16-bit ints, so we bitcast to that.
+  depth = Image.fromarray(depth.astype(np.float16).view(np.uint16))
 
-  depth = depth / mag_max
-  depth = np.clip(depth * 255, 0, 255).astype(np.uint8)
+  if isinstance(path, str):
+    path = Path(path)
+  if path.suffix != ".tiff":
+    raise RuntimeError(f"Unsupported {path.suffix=}")
 
-  depth = Image.fromarray(depth)
-
-  if with_exif:
-    exif = DepthExif(mag_max)
-    exif.img_write(depth)
-
-  return depth
+  depth.save(path, compression="tiff_deflate")
 
 # [H, W, 1]
 def image_to_depth(
-  img: str | Path | Image.Image,
+  path: str | Path,
 ) -> np.ndarray:
-  if isinstance(img, str):
-    img = Path(img)
-  if isinstance(img, Path):
-    img = Image.open(img)
-  if isinstance(img, Image.Image):
-    exif = DepthExif.img_read(img)
+  img = Image.open(path)
 
-    img: np.ndarray
-    img = np.asarray(img)
-    img = img.astype(np.float64)
-    img = img / 255
-    img = img * exif.mag_max
-
-    return img
-  raise RuntimeError(f"Unexpected {type(img)=}")
+  img: np.ndarray
+  img = np.asarray(img)
+  if img.dtype != np.uint16:
+    raise RuntimeError(f"Unexpected {img.dtype=}")
+  img = img.view(np.float16)
+  return img
 
 def test_image_depth_conversion():
-  depth = np.linspace(0, 50, num=100*100).reshape(100, 100)
-  depth_img = depth_to_image(depth)
-  depth_roundtrip = image_to_depth(depth_img)
+  with TemporaryDirectory() as tmp_dir:
+    img_path = osp.join(tmp_dir, "depth.tiff")
 
-  assert np.all(np.isclose(depth, depth_roundtrip, atol=0.25))
+    depth = np.linspace(0, 50, num=100*100).reshape(100, 100)
+    depth_to_image(img_path, depth)
+    depth_roundtrip = image_to_depth(img_path)
+
+  assert np.all(np.isclose(depth, depth_roundtrip, atol=0.0001))
+
+############################################################
+#                    Deformation Image                     #
+############################################################
