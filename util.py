@@ -1,4 +1,5 @@
 import contextlib as ctl
+import dataclasses as dc
 import functools as ft
 import glob
 import hashlib
@@ -10,7 +11,7 @@ import subprocess
 import threading
 import time
 import urllib
-from typing import Callable, Generic, Optional, TypeVar
+from typing import Any, Callable, Generic, Optional, TypeVar
 
 import requests
 from tqdm import tqdm
@@ -19,6 +20,11 @@ logger = logging.getLogger(__name__)
 _logger = logger
 
 REPO_ROOT = osp.dirname(__file__)
+
+def pipe(a, *fns):
+  for fn in fns:
+    a = fn(a)
+  return a
 
 def proc(
   executable: str,

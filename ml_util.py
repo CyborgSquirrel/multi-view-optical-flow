@@ -1,16 +1,23 @@
 import abc
 import dataclasses as dc
 import logging
+import os
+import os.path as osp
 import re
 import struct
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Callable, ClassVar, Optional, Self
 
+import humanize
 import imageio as iio
 import numpy as np
+import tifffile
 import torch
 import torch.nn.functional as F
 from PIL import ExifTags, Image
+
+from util import pipe
 
 logger = logging.getLogger(__name__)
 
@@ -472,24 +479,24 @@ def depth_to_image(
   if isinstance(depth, torch.Tensor):
     depth = depth.cpu().numpy()
 
-  # NOTE: TIFF supports 16-bit ints, so we bitcast to that.
-  depth = Image.fromarray(depth.astype(np.float16).view(np.uint16))
-
   if isinstance(path, str):
     path = Path(path)
   if path.suffix != ".tiff":
     raise RuntimeError(f"Unsupported {path.suffix=}")
 
-  depth.save(path, compression="tiff_deflate")
+  # NOTE: TIFF supports 16-bit ints, so we bitcast to that.
+  tifffile.imwrite(
+    path,
+    depth.astype(np.float16).view(np.uint16),
+    compression="ZLIB",
+    photometric="minisblack",
+  )
 
 # [H, W, 1]
 def image_to_depth(
   path: str | Path,
 ) -> np.ndarray:
-  img = Image.open(path)
-
-  img: np.ndarray
-  img = np.asarray(img)
+  img = tifffile.imread(path)
   if img.dtype != np.uint16:
     raise RuntimeError(f"Unexpected {img.dtype=}")
   img = img.view(np.float16)
@@ -499,12 +506,88 @@ def test_image_depth_conversion():
   with TemporaryDirectory() as tmp_dir:
     img_path = osp.join(tmp_dir, "depth.tiff")
 
-    depth = np.linspace(0, 50, num=100*100).reshape(100, 100)
+    depth = np.linspace(0, 50, num=800*400).reshape(800, 400)
     depth_to_image(img_path, depth)
+    logger.info("Image size %r", humanize.naturalsize(os.stat(img_path).st_size))
     depth_roundtrip = image_to_depth(img_path)
 
-  assert np.all(np.isclose(depth, depth_roundtrip, atol=0.0001))
+  assert np.all(np.isclose(depth, depth_roundtrip, rtol=0.001))
 
 ############################################################
 #                    Deformation Image                     #
 ############################################################
+
+def deformation_to_image(
+  path: str | Path,
+  # [H, W, 3]
+  deformation: torch.Tensor | np.ndarray,
+):
+  shape = tuple(deformation.shape)
+  match shape:
+    case (_h, _w, 3):
+      pass
+    case _:
+      raise TypeError(f"Unexpected {shape=}")
+
+  if isinstance(deformation, torch.Tensor):
+    deformation = deformation.cpu().numpy()
+
+  if isinstance(path, str):
+    path = Path(path)
+  if path.suffix != ".tiff":
+    raise RuntimeError(f"Unsupported {path.suffix=}")
+
+  # NOTE: TIFF supports 16-bit ints, so we bitcast to that.
+  tifffile.imwrite(
+    path,
+    deformation.astype(np.float16).view(np.uint16),
+    compression="ZLIB",
+    photometric="rgb",
+  )
+
+# [H, W, 3]
+def image_to_deformation(
+  path: str | Path,
+) -> np.ndarray:
+  img = tifffile.imread(path)
+
+  # sanity checks
+  dtype = img.dtype
+  if dtype != np.uint16:
+    raise RuntimeError(f"Unexpected {dtype=}")
+  img = img.view(np.float16)
+
+  shape = img.shape
+  match shape:
+    case (_h, _w, 3):
+      pass
+    case _:
+      raise RuntimeError(f"Unexpected {shape=}")
+
+  return img
+
+def test_image_deformation_conversion():
+  with TemporaryDirectory() as tmp_dir:
+    img_path = osp.join(tmp_dir, "deformation.tiff")
+
+    deformation = np.linspace(0, 50, num=800*400*3).reshape(800, 400, 3)
+    deformation_to_image(img_path, deformation)
+    logger.info("Image size %r", humanize.naturalsize(os.stat(img_path).st_size))
+    deformation_roundtrip = image_to_deformation(img_path)
+
+  assert np.all(np.isclose(deformation, deformation_roundtrip, rtol=0.001))
+
+def normify(a):
+  a_mag = pipe(
+    a,
+    lambda a: np.linalg.norm(a, ord=2, axis=-1, keepdims=True),
+    lambda a: np.max(a, axis=-1, keepdims=True),
+  )
+
+  a_norm = pipe(
+    a,
+    lambda a: a / a_mag,
+    lambda a: (a + 1) / 2,
+  )
+
+  return a_norm
