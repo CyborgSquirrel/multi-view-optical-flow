@@ -26,6 +26,21 @@ try:
 except ModuleNotFoundError:
   logger.warning("Unimatch not setup, can't import it...")
 
+def normify(a):
+  a_mag = pipe(
+    a,
+    lambda a: np.linalg.norm(a, ord=2, axis=-1, keepdims=True),
+    lambda a: np.max(a, axis=tuple(i for i in range(len(a.shape)))[:-1], keepdims=True),
+  )
+
+  a_norm = pipe(
+    a,
+    lambda a: a / a_mag,
+    lambda a: (a + 1) / 2,
+  )
+
+  return a_norm
+
 RE_VIDEO_FRAME = re.compile(r"(?P<name>.*[.]mp4):(?P<index>\d+)$")
 
 def load_img(
@@ -577,17 +592,229 @@ def test_image_deformation_conversion():
 
   assert np.all(np.isclose(deformation, deformation_roundtrip, rtol=0.001))
 
-def normify(a):
-  a_mag = pipe(
-    a,
-    lambda a: np.linalg.norm(a, ord=2, axis=-1, keepdims=True),
-    lambda a: np.max(a, axis=-1, keepdims=True),
-  )
+############################################################
+#                       Normed Image                       #
+############################################################
 
-  a_norm = pipe(
-    a,
-    lambda a: a / a_mag,
+@dc.dataclass
+class NormedImageExif(MetaExif):
+  mag_max: float
+
+  STRUCT_FMT: ClassVar = ">d"
+  def exif_encode(self) -> bytes:
+    return struct.pack(self.STRUCT_FMT, self.mag_max)
+  @classmethod
+  def exif_decode(cls, src: bytes) -> Self:
+    mag_max, = struct.unpack(cls.STRUCT_FMT, src)
+    return cls(mag_max)
+
+def array_to_normed_image(
+  path: str | Path,
+  # [H, W, 3] | [H, W, 1]
+  arr: np.ndarray,
+  *,
+  mag_max: Optional[float] = None,
+) -> str | Path:
+  original_path = path
+
+  shape = arr.shape
+  match shape:
+    case (_h, _w, 3) | (_h, _w, 1):
+      pass
+    case _:
+      raise RuntimeError(f"Unexpected {shape=}")
+
+  if isinstance(path, str):
+    path = Path(path)
+  if path.suffix != ".png":
+    raise RuntimeError(f"Unsupported {path.suffix=}")
+
+  if mag_max is None:
+    mag_max = pipe(
+      arr,
+      lambda a: np.linalg.norm(a, ord=2, axis=-1, keepdims=True),
+      lambda a: np.max(a),
+    )
+
+  norm = pipe(
+    arr,
+    lambda a: a / mag_max,
     lambda a: (a + 1) / 2,
   )
 
-  return a_norm
+  img = pipe(
+    norm,
+    lambda a: np.clip(a * 255, 0, 255),
+    lambda a: a.astype(np.uint8),
+  )
+
+  if img.shape[-1] == 1:
+    img = img[..., 0]
+
+  exif = NormedImageExif(mag_max=mag_max)
+
+  img = Image.fromarray(img)
+  exif.img_write(img)
+
+  img.save(path, exif=img.getexif())
+
+  return original_path
+
+# [H, W, 3] | [H, W, 1]
+def normed_image_to_array(
+  path: str | Path,
+) -> np.ndarray:
+  img = Image.open(path)
+  exif = NormedImageExif.img_read(img)
+  mag_max = exif.mag_max
+  img = np.asarray(img)
+
+  shape = img.shape
+  match shape:
+    case (_h, _w, 3):
+      pass
+    case (_h, _w):
+      img = img[..., None]
+    case _:
+      raise RuntimeError(f"Unexpected {shape=}")
+
+  arr = pipe(
+    img,
+    lambda a: a.astype(np.float64),
+    lambda a: a / 255,
+    lambda a: a * 2 - 1,
+    lambda a: a * mag_max,
+  )
+
+  return arr
+
+def test_normed_image_conversion_3():
+  with TemporaryDirectory() as tmp_dir:
+    img_path = osp.join(tmp_dir, "normed.png")
+
+    base = 8
+
+    a = np.linspace(-5, 5, num=base**2)
+    x, y, z = np.meshgrid(a, a, a)
+    xyz = np.stack([x, y, z], axis=-1)
+    xyz = xyz.reshape(base**3, base**3, 3)
+    arr = xyz
+
+    arr_roundtrip = normed_image_to_array(array_to_normed_image(img_path, arr))
+
+  assert np.all(np.isclose(arr, arr_roundtrip, atol=0.075))
+
+def test_normed_image_conversion_1():
+  with TemporaryDirectory() as tmp_dir:
+    img_path = osp.join(tmp_dir, "normed.png")
+
+    base = 8**3
+
+    a = np.linspace(-5, 5, num=base**2)
+    arr = a.reshape(base, base, 1)
+
+    arr_roundtrip = normed_image_to_array(array_to_normed_image(img_path, arr))
+
+  assert np.all(np.isclose(arr, arr_roundtrip, atol=0.05))
+
+############################################################
+#                        Mag Image                         #
+############################################################
+
+@dc.dataclass
+class MagImageExif(MetaExif):
+  mag_max: float
+
+  STRUCT_FMT: ClassVar = ">d"
+  def exif_encode(self) -> bytes:
+    return struct.pack(self.STRUCT_FMT, self.mag_max)
+  @classmethod
+  def exif_decode(cls, src: bytes) -> Self:
+    mag_max, = struct.unpack(cls.STRUCT_FMT, src)
+    return cls(mag_max)
+
+def array_to_mag_image(
+  path: str | Path,
+  # [H, W, 1]
+  arr: np.ndarray,
+  *,
+  mag_max: Optional[float] = None,
+) -> str | Path:
+  original_path = path
+
+  shape = arr.shape
+  match shape:
+    case (_h, _w, 1):
+      pass
+    case _:
+      raise RuntimeError(f"Unexpected {shape=}")
+
+  if isinstance(path, str):
+    path = Path(path)
+  if path.suffix != ".png":
+    raise RuntimeError(f"Unsupported {path.suffix=}")
+
+  if np.any(arr < 0):
+    raise RuntimeError("All values must be positive")
+
+  if mag_max is None:
+    mag_max = np.max(arr)
+
+  norm = pipe(
+    arr,
+    lambda a: a / mag_max,
+  )
+
+  img = pipe(
+    norm,
+    lambda a: np.clip(a * 255, 0, 255),
+    lambda a: a.astype(np.uint8),
+    lambda a: a[..., 0]
+  )
+
+  exif = MagImageExif(mag_max=mag_max)
+
+  img = Image.fromarray(img)
+  exif.img_write(img)
+
+  img.save(path, exif=img.getexif())
+
+  return original_path
+
+# [H, W, 1]
+def mag_image_to_array(
+  path: str | Path,
+) -> np.ndarray:
+  img = Image.open(path)
+  exif = MagImageExif.img_read(img)
+  mag_max = exif.mag_max
+  img = np.asarray(img)
+
+  shape = img.shape
+  match shape:
+    case (_h, _w):
+      img = img[..., None]
+    case _:
+      raise RuntimeError(f"Unexpected {shape=}")
+
+  arr = pipe(
+    img,
+    lambda a: a.astype(np.float64),
+    lambda a: a / 255,
+    lambda a: a * mag_max,
+  )
+
+  return arr
+
+def test_mag_image_conversion():
+  with TemporaryDirectory() as tmp_dir:
+    img_path = osp.join(tmp_dir, "mag.png")
+
+    base = 8**3
+
+    a = np.linspace(0, 10, num=base**2)
+    arr = a.reshape(base, base, 1)
+
+    arr_roundtrip = mag_image_to_array(array_to_mag_image(img_path, arr))
+
+  assert np.all(np.isclose(arr, arr_roundtrip, atol=0.05))

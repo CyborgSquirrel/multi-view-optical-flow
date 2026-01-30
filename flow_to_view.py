@@ -17,15 +17,16 @@ from ml_util import (depth_to_image, flow_to_hue_flow, flow_to_image_hue,
                      image_to_depth, image_to_flow_hue, load_img, numpify)
 from unimatch.unimatch import flow_warp
 
-IMAGE_PATH_FMT = "./nersemble-data/018/sequences/EMO-1-shout+laugh/images/cam_{pose}.mp4:{frame}"
-# DEPTH_PATH_FMT = "/media/andrei/gdrive/adl4cv/nersemble-out/NERS-9018_{pose}_depth-{frame}_checkpoint-300000.png"
-DEPTH_PATH_FMT = "./depth/NERS-9018_{pose}_depth-{frame}_checkpoint-300000.tiff"
-BG_PATH_FMT = "./nersemble-data/018/sequences/BACKGROUND/image_{pose}.jpg"
-FLOW_PATH_FMT = "./flow/cam_{pose}/{frame}-flow.png"
+EXP_NAME = "warped-flow-2d-linear"
 
-MODEL_PATH_FMT = "./model/{output}_{pose}.ply"
+IMAGE_PATH = "./nersemble-data/018/sequences/EMO-1-shout+laugh/images/cam_{pose}.mp4:{frame}"
+DEPTH_PATH = "./depth/NERS-9018_{pose}_depth-{frame}_checkpoint-300000.tiff"
+BG_PATH = "./nersemble-data/018/sequences/BACKGROUND/image_{pose}.jpg"
+FLOW_PATH = "./flow/{pose}-{frame}-flow.png"
 
-WARPED_2D_FLOW_PATH_FMT = "./warped-flow-2d/{pose}-{frame}.png"
+MODEL_PATH = "./model/{output}_{pose}.ply"
+
+WARPED_2D_FLOW_PATH = "./{exp}/{pose}-{frame}.png"
 
 CAMERA_PARAMS_PATH = "/home/andrei/adl4cv-project/nersemble-data/018/calibration/camera_params.json"
 @ft.cache
@@ -45,7 +46,7 @@ def make_flow(
     pose=pose_id,
   )
 
-  output_path = WARPED_2D_FLOW_PATH_FMT.format(**fmt, frame=fr0)
+  output_path = WARPED_2D_FLOW_PATH.format(**fmt, frame=fr0, exp=EXP_NAME)
   os.makedirs(osp.dirname(output_path), exist_ok=True)
   if osp.exists(output_path):
     return
@@ -73,15 +74,14 @@ def make_flow(
   intr = Intrinsics(camera_params()["intrinsics"])
 
   # load images
-  bg = load_img(BG_PATH_FMT.format(**fmt), output_type=np.ndarray)
-  flow = image_to_flow_hue(FLOW_PATH_FMT.format(**fmt, frame=fr0))
+  bg = load_img(BG_PATH.format(**fmt), output_type=np.ndarray)
+  flow = image_to_flow_hue(FLOW_PATH.format(**fmt, frame=fr0))
 
-  im0 = load_img(IMAGE_PATH_FMT.format(**fmt, frame=fr0), output_type=np.ndarray)
-  im1 = load_img(IMAGE_PATH_FMT.format(**fmt, frame=fr1), output_type=np.ndarray)
+  im0 = load_img(IMAGE_PATH.format(**fmt, frame=fr0), output_type=np.ndarray)
+  im1 = load_img(IMAGE_PATH.format(**fmt, frame=fr1), output_type=np.ndarray)
 
-  print(DEPTH_PATH_FMT.format(**fmt, frame=fr0))
-  dt0 = image_to_depth(DEPTH_PATH_FMT.format(**fmt, frame=fr0))[..., None].astype(np.float64)
-  # dt1 = image_to_depth(DEPTH_PATH_FMT.format(**fmt, frame=fr1))[..., None].astype(np.float64)
+  dt0 = image_to_depth(DEPTH_PATH.format(**fmt, frame=fr0))[..., None].astype(np.float64)
+  # dt1 = image_to_depth(DEPTH_PATH.format(**fmt, frame=fr1))[..., None].astype(np.float64)
 
   # resize images
   shape = dt0.shape[:2]
@@ -116,8 +116,8 @@ def make_flow(
   xy   = xy  .reshape(-1, xy  .shape[-1])
   xy0  = xy0 .reshape(-1, xy0 .shape[-1])
   xy1  = xy1 .reshape(-1, xy1 .shape[-1])
-  dt0  = dt0 .reshape(-1, dt0 .shape[-1])
   # dt1  = dt1 .reshape(-1, dt1 .shape[-1])
+  dt0  = dt0 .reshape(-1, dt0 .shape[-1])
   rgb0 = rgb0.reshape(-1, rgb0.shape[-1])
   rgb1 = rgb1.reshape(-1, rgb1.shape[-1])
   bg   = bg  .reshape(-1, bg  .shape[-1])
@@ -164,17 +164,17 @@ def make_flow(
     xyz1 = xyzh1[..., :3] / xyzh1[..., [3]]
 
     # unapply intrinsics
-    xy0 = np.einsum("ij,aj->ai", intr, xyz0)
-    xy1 = np.einsum("ij,aj->ai", intr, xyz1)
+    xyz0 = np.einsum("ij,aj->ai", intr, xyz0)
+    xyz1 = np.einsum("ij,aj->ai", intr, xyz1)
 
     # sort by increasing z axis
-    sort_idx = np.argsort(xy1[..., 2])
-    xy0 = xy0[sort_idx]
-    xy1 = xy1[sort_idx]
+    sort_idx = np.argsort(xyz1[..., 2])
+    xyz0 = xyz0[sort_idx]
+    xyz1 = xyz1[sort_idx]
 
     # unapply depth
-    xy0 = xy0[..., :2] / xy0[..., [2]]
-    xy1 = xy1[..., :2] / xy1[..., [2]]
+    xy0 = xyz0[..., :2] / xyz0[..., [2]]
+    xy1 = xyz1[..., :2] / xyz1[..., [2]]
 
   # get scene flow
   # if True:
@@ -185,22 +185,38 @@ def make_flow(
 
   flow2 = xy0 - xy1
 
-  # thing = griddata(xy1, flow2, xy, fill_value=0)
-  # print(thing)
 
 
+  ### warp with interpolation
+  dt_dst0 = image_to_depth(DEPTH_PATH.format(pose=pose_dst_id, frame=fr0))[..., None].astype(np.float64)
+  dt_dst0 = dt_dst0.reshape(-1, dt_dst0.shape[-1])
+
+  xyh_dst0 = np.concat([xy, np.ones( xy.shape[:-1] + (1,) )], axis=-1)
+  xyz_dst0 = xyh_dst0 * dt_dst0
+  flow2_interp = griddata(xyz0, flow2, xyz_dst0, fill_value=0, method="linear")
+  # flow2_interp = griddata(xyz0, flow2, xyz_dst0, fill_value=0, method="nearest")
+  flow_img = np.zeros(shape + (2,))
+  idk = xy // 4
 
   flow_img = np.zeros(shape + (2,))
-  xym = np.round(xy1 / mul).astype(int)
-  mask = (
-      (xym[...,0] >= 0) & (xym[...,0] < shape[1])
-    & (xym[...,1] >= 0) & (xym[...,1] < shape[0])
-  )
-  flow2 = flow2[mask]
-  xym = xym[mask]
-  flow_img[xym[...,1], xym[...,0]] = flow2
+  flow_img[idk[...,1], idk[...,0]] = flow2_interp 
   flow_img = flow_to_image_hue(flow_img)
   flow_img.save(output_path, exif=flow_img.getexif())
+
+
+
+  ### warp with binning
+  # flow_img = np.zeros(shape + (2,))
+  # xym = np.round(xy1 / mul).astype(int)
+  # mask = (
+  #     (xym[...,0] >= 0) & (xym[...,0] < shape[1])
+  #   & (xym[...,1] >= 0) & (xym[...,1] < shape[0])
+  # )
+  # flow2 = flow2[mask]
+  # xym = xym[mask]
+  # flow_img[xym[...,1], xym[...,0]] = flow2
+  # flow_img = flow_to_image_hue(flow_img)
+  # flow_img.save(output_path, exif=flow_img.getexif())
 
 
 
@@ -210,23 +226,23 @@ def make_flow(
   # trimesh.points.PointCloud(
   #   np.concat([ xy1, np.zeros( xy1.shape[:-1] )[..., None] ], axis=-1),
   #   colors=flow_hue,
-  # ).export(MODEL_PATH_FMT.format(output="flow", pose=pose_id))
+  # ).export(MODEL_PATH.format(output="flow", pose=pose_id))
 
   # trimesh.points.PointCloud(
   #   np.concat([ xy1, np.zeros( xy1.shape[:-1] )[..., None] ], axis=-1),
   #   colors=rgb1,
-  # ).export(MODEL_PATH_FMT.format(output="color", pose=pose_id))
+  # ).export(MODEL_PATH.format(output="color", pose=pose_id))
 
 
 
   # trimesh.points.PointCloud(
   #   xyz1,
   #   colors=flow3,
-  # ).export(MODEL_PATH_FMT.format(output="flow", pose=pose_id))
+  # ).export(MODEL_PATH.format(output="flow", pose=pose_id))
 
 def main():
   pose_ids = [
-    "221501007",
+    # "221501007",
 
     "220700191",
     "222200036",

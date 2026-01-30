@@ -202,8 +202,8 @@ def make_flow(
   flow2 = -(xy00 - xy0)
   # flow2 = delta[..., :2]
 
-  if True:
-  # if False:
+  # if True:
+  if False:
     flow2_mag = np.linalg.norm(flow2, axis=-1, keepdims=True)
     flow2 = flow2 / flow2_mag
 

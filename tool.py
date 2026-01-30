@@ -25,9 +25,11 @@ from pydantic import BaseModel
 from tqdm import tqdm
 
 from colab_util import IN_COLAB, PROJECT_PATH
-from ml_util import (FlowExif, flow_to_image_hue, forward_warp,
-                     image_to_flow_hue, load_img, unimatch_get_transform,
-                     unimatch_load_img)
+from ml_util import (FlowExif, MagImageExif, NormedImageExif,
+                     array_to_mag_image, array_to_normed_image,
+                     flow_to_image_hue, forward_warp, image_to_flow_hue,
+                     load_img, mag_image_to_array, normed_image_to_array,
+                     unimatch_get_transform, unimatch_load_img)
 from util import deps, make_setup_subparser, osp, proc, resolve_local_path
 
 logger = logging.getLogger(__name__)
@@ -486,6 +488,52 @@ def tool_flow_norm_mag():
     if osp.exists(output_path):
       logger.warning("Overwriting %r...", output_path)
     img.save(output_path, exif=img.getexif())
+
+@setup_subparser
+def subparser(subparser: ArgumentParser):
+  arg = subparser.add_argument
+  arg("output", type=Path)
+  arg("path", type=Path, nargs="+")
+@subparser
+def tool_other_norm_mag():
+  mag_max = None
+  for path in tqdm(parser_args.path, desc="Calculating maximum magnitude"):
+    exif = NormedImageExif.img_read(Image.open(path))
+    if mag_max is None:
+      mag_max = exif.mag_max
+    else:
+      mag_max = max(mag_max, exif.mag_max)
+  logger.info("Calculated mag_max=%r", mag_max)
+
+  for path in tqdm(parser_args.path, desc="Writing normalized"):
+    output_path = osp.join(parser_args.output, osp.basename(path))
+    if osp.exists(output_path):
+      logger.warning("Overwriting %r...", output_path)
+    arr = normed_image_to_array(path)
+    array_to_normed_image(output_path, arr, mag_max=mag_max)
+
+@setup_subparser
+def subparser(subparser: ArgumentParser):
+  arg = subparser.add_argument
+  arg("output", type=Path)
+  arg("path", type=Path, nargs="+")
+@subparser
+def tool_other2_norm_mag():
+  mag_max = None
+  for path in tqdm(parser_args.path, desc="Calculating maximum magnitude"):
+    exif = MagImageExif.img_read(Image.open(path))
+    if mag_max is None:
+      mag_max = exif.mag_max
+    else:
+      mag_max = max(mag_max, exif.mag_max)
+  logger.info("Calculated mag_max=%r", mag_max)
+
+  for path in tqdm(parser_args.path, desc="Writing normalized"):
+    output_path = osp.join(parser_args.output, osp.basename(path))
+    if osp.exists(output_path):
+      logger.warning("Overwriting %r...", output_path)
+    arr = mag_image_to_array(path)
+    array_to_mag_image(output_path, arr, mag_max=mag_max)
 
 @setup_subparser
 def subparser(subparser: ArgumentParser):
