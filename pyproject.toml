@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+# pls don't eat the logs pytest
+log_cli = true
+log_cli_level = "INFO"

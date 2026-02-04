@@ -196,7 +196,6 @@ def main():
     frame_iter = iio.imiter(path, plugin="pyav")
     frame_iter = enumerate(frame_iter)
     frame_iter = tqdm(frame_iter, total=frames_no)
-    frame_iter = itt.islice(frame_iter, 95, 105)
 
     # Set up frame deque
     maxlen = FRAME_GAP + 2
