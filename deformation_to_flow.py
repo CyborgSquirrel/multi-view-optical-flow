@@ -38,6 +38,8 @@ def camera_params():
   with open(CAMERA_PARAMS_PATH) as f:
     return json.load(f)
 
+DELTA_EMA = dict()
+
 def make_flow(
   *,
   pose_id: str,
@@ -53,8 +55,8 @@ def make_flow(
 
   output_path = FLOW_PATH.format(pose=pose_id, frame=fr0)
   os.makedirs(osp.dirname(output_path), exist_ok=True)
-  if osp.exists(output_path):
-    return
+  # if osp.exists(output_path):
+  #   return
 
   # pose
   scale_factor = 9
@@ -123,27 +125,6 @@ def make_flow(
   #     + pn.geom_density()
   #   ).show()
 
-  # remove background
-  if True:
-  # if False:
-    # is_bg = (
-    #     (np.linalg.norm(rgb0 - bg, axis=-1, ord=2) <= 0.2)
-    #   | (np.linalg.norm(rgb1 - bg, axis=-1, ord=2) <= 0.2)
-    # )
-    is_bg = (
-        (np.linalg.norm(dfm0, axis=-1, ord=2) <= 0.01)
-      | (np.linalg.norm(dfm1, axis=-1, ord=2) <= 0.01)
-    )
-
-    fn = lambda a: a[~is_bg]
-    xy0     = pipe(xy0    , fn)
-    dt0     = pipe(dt0    , fn)
-    rgb0    = pipe(rgb0   , fn)
-    rgb1    = pipe(rgb1   , fn)
-    dfm0    = pipe(dfm0   , fn)
-    dfm1    = pipe(dfm1   , fn)
-    unimfl0 = pipe(unimfl0, fn)
-
   xy00 = xy0
 
   with ctl.ExitStack() as stack:
@@ -181,11 +162,22 @@ def make_flow(
     # xyz0 = xyz0 - dfm0
     # b_xyz0 = xyz0
 
-    delta = -(dfm0 - dfm1)
+    delta = dfm1 - dfm0
+    if pose_id not in DELTA_EMA:
+      DELTA_EMA[pose_id] = dict(ema=delta)
+    else:
+      assert DELTA_EMA[pose_id]["frame"] == fr0-1
+
+      alpha = 0.6
+      DELTA_EMA[pose_id]["ema"] = (1 - alpha) * DELTA_EMA[pose_id]["ema"] + alpha * delta
+    DELTA_EMA[pose_id]["frame"] = fr0
+
+    delta_ema = DELTA_EMA[pose_id]["ema"]
+
     # delta = delta * np.array([4, 4, 1])[None, ...]
 
     a_xyz0 = xyz0
-    xyz0 = xyz0 - delta
+    xyz0 = xyz0 + delta_ema
     b_xyz0 = xyz0
 
     # sort by increasing z axis
@@ -199,7 +191,29 @@ def make_flow(
   #   # flow3_amax = np.max(np.abs(flow3))
   #   # flow3 = ((flow3 / flow3_amax) + 1) / 2
 
+  # remove background
+  if True:
+  # if False:
+    # is_bg = (
+    #     (np.linalg.norm(rgb0 - bg, axis=-1, ord=2) <= 0.2)
+    #   | (np.linalg.norm(rgb1 - bg, axis=-1, ord=2) <= 0.2)
+    # )
+    is_bg = (
+        (np.linalg.norm(dfm0, axis=-1, ord=2) <= 0.01)
+      | (np.linalg.norm(dfm1, axis=-1, ord=2) <= 0.01)
+    )
+
+    fn = lambda a: a[~is_bg]
+    xy0     = pipe(xy0    , fn)
+    xy00    = pipe(xy00   , fn)
+    rgb0    = pipe(rgb0   , fn)
+    rgb1    = pipe(rgb1   , fn)
+    # dfm0    = pipe(dfm0   , fn)
+    # dfm1    = pipe(dfm1   , fn)
+    # unimfl0 = pipe(unimfl0, fn)
+
   flow2 = -(xy00 - xy0)
+  # print(np.max(np.linalg.norm(flow2, axis=-1)))
   # flow2 = delta[..., :2]
 
   # if True:
@@ -225,7 +239,7 @@ def make_flow(
   if True:
     ### warp with binning
     flow_img = np.zeros(shape + (2,))
-    xym = np.round(xy00 / mul).astype(int)
+    xym = (xy00 // mul).astype(int)
     # mask = (
     #     (xym[...,0] >= 0) & (xym[...,0] < shape[1])
     #   & (xym[...,1] >= 0) & (xym[...,1] < shape[0])
@@ -320,7 +334,7 @@ def main():
   pose_ids = [
     # "221501007",
 
-    "220700191",
+    # "220700191",
     # "222200036",
     # "222200037",
     # "222200038",
@@ -335,9 +349,23 @@ def main():
     # "222200047",
     # "222200048",
     # "222200049",
+
+    "222200044",
+    "222200038",
+    "222200045",
+    "222200041",
+    # "222200046",
+    "222200039",
+    "221501007",
+    "222200037",
+    "222200040",
+    # "220700191",
+    "222200036",
+    "222200043",
   ]
 
-  for fr0 in tqdm(range(1, 413+1)):
+  for fr0 in tqdm(range(105, 413)):
+  # for fr0 in tqdm(range(60,80)):
   # for fr0 in [1, 2, 3, 287, 288]:
   # for fr0 in [1]:
   # for fr0 in [287]:
