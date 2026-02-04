@@ -5,9 +5,6 @@ import os
 import os.path as osp
 
 import numpy as np
-import plotnine as pn
-import polars as pl
-import torch
 import trimesh
 from dreifus.matrix import (CameraCoordinateConvention, Intrinsics, Pose,
                             PoseType)
