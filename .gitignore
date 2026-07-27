@@ -28,3 +28,7 @@ experiments/
 *.png
 *.tiff
 *.ply
+
+# keep README assets
+!assets/
+!assets/*.png
